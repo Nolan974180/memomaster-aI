@@ -1,5 +1,5 @@
 openai
-gradio
+gradio>=4.44.0
 reportlab
 python-docx
 pdfminer.six
