@@ -1,115 +1,185 @@
-# === MemoMaster (Gradio UI) ===
-# Génère des fiches de révision IA à partir de fichiers (.pdf, .docx, .txt)
+# === MémoMaster (Render + Gradio) ============================================
+# - Onglet 1 : générateur de fiches IA à partir de .txt / .pdf / .docx (+ export PDF)
+# - Onglet 2 : bulle de chat (tuteur IA)
+# - Branding Gradio masqué
+# - Lit la clé depuis la variable d'env OPENAI_API_KEY
+# ============================================================================
 
-import os, io, traceback
+import os, io, tempfile, traceback
+
 import gradio as gr
 from openai import OpenAI
 
-# PDF export
+# --- Extraction texte depuis .pdf / .docx / .txt ---
+from pdfminer.high_level import extract_text as pdf_extract_text
+from docx import Document
+
+# --- Export PDF ---
 from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 
-# Lecture DOCX / PDF
-from docx import Document as DocxDocument      # package: python-docx
-from pdfminer.high_level import extract_text    # package: pdfminer.six
-
 # === Config ===
-DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_MODEL = "gpt-4o-mini"   # peu coûteux, assez bon pour ce cas
+SYSTEM_SUMMARY = (
+    "Tu es un assistant qui produit des fiches de révision claires, structurées, "
+    "avec titres, sous-titres, définitions, exemples, rappels de méthode et, si utile, "
+    "quelques QCM ou Vrai/Faux en fin de fiche."
+)
+SYSTEM_TUTOR = (
+    "Tu es un tuteur bienveillant. Explique simplement, propose des exemples, des quiz, "
+    "et reformule si on te le demande. Si l’utilisateur colle un cours/exercice, aide-le à réviser."
+)
 
-# === OpenAI Client (clé lue dans les variables d'env de Render) ===
+# === OpenAI client (clé en variable d'environnement) ===
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-# === Utils: convertir un input Gradio File -> texte ===
-def _read_uploaded_file(file_obj) -> str:
-    """
-    Supporte :
-      - gradio qui renvoie un dict ({"name": <path>, ...})
-      - gradio qui renvoie un chemin (str) ou un fichier temporaire (obj avec .name)
-    """
-    # Normaliser vers un chemin
-    path = None
-    if file_obj is None:
-        return ""
-    if isinstance(file_obj, dict) and "name" in file_obj:
-        path = file_obj["name"]
-    elif isinstance(file_obj, str):
-        path = file_obj
-    elif hasattr(file_obj, "name"):
-        path = file_obj.name
+# === Outils ==================================================================
 
-    if not path or not os.path.exists(path):
+def read_file_to_text(upfile) -> str:
+    """Retourne le texte du fichier (.txt/.pdf/.docx)."""
+    if upfile is None:
         return ""
+    name = (getattr(upfile, "name", "") or "").lower()
 
-    lower = path.lower()
     try:
-        if lower.endswith(".txt"):
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                return f.read()
-        elif lower.endswith(".docx"):
-            doc = DocxDocument(path)
-            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-        elif lower.endswith(".pdf"):
-            return extract_text(path) or ""
+        if name.endswith(".pdf"):
+            return pdf_extract_text(upfile.name)
+        elif name.endswith(".docx"):
+            doc = Document(upfile.name)
+            return "\n".join(p.text for p in doc.paragraphs)
         else:
-            # Fallback lecture binaire → utf-8
-            with open(path, "rb") as f:
+            # .txt ou inconnu -> on tente UTF-8
+            with open(upfile.name, "rb") as f:
                 return f.read().decode("utf-8", errors="ignore")
     except Exception:
-        traceback.print_exc()
-        return ""
+        return "⚠️ Erreur pendant la lecture du fichier."
 
-# === PDF Export ===
-def export_to_pdf(text, filename="fiche_revision.pdf"):
+def export_to_pdf(text: str) -> str:
+    """Crée un PDF temporaire avec le texte et renvoie le chemin du fichier."""
+    styles = getSampleStyleSheet()
+    normal = styles["Normal"]
+
+    # fichier temporaire (Render/Gradio ok)
+    fd, path = tempfile.mkstemp(prefix="fiche_", suffix=".pdf")
+    os.close(fd)
+
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4)
-    styles = getSampleStyleSheet()
-    flow = [Paragraph(p, styles["Normal"]) for p in text.split("\n") if p.strip()]
+    flow = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            flow.append(Spacer(1, 8))
+        else:
+            flow.append(Paragraph(line, normal))
     doc.build(flow)
-    with open(filename, "wb") as f:
+
+    with open(path, "wb") as f:
         f.write(buf.getvalue())
-    return filename
+    return path
 
-# === IA Summary Function ===
-def generate_summary(file, cours_titre):
-    source = _read_uploaded_file(file)
-    if not source.strip():
-        return "❌ Fichier vide ou illisible. Essaie .txt, .pdf ou .docx.", None
+# === IA : génération de fiche ===============================================
 
+def generate_summary(upfile, cours_titre):
     try:
+        content = read_file_to_text(upfile)
+        if not content.strip():
+            return "⚠️ Aucun texte détecté dans le fichier.", None
+
+        user_prompt = (
+            f"Crée une fiche de révision claire et concise pour le cours « {cours_titre or 'Sans titre'} ».\n\n"
+            f"--- CONTENU DU COURS ---\n{content}\n"
+            f"------------------------\n"
+            "Structure attendue :\n"
+            "1) Titre / Objectifs\n2) Notions clés (définitions courtes)\n"
+            "3) Méthodes / étapes\n4) Exemples\n5) Erreurs fréquentes\n6) Mini-quiz (3-5 QCM ou V/F)\n"
+        )
+
         resp = client.chat.completions.create(
             model=DEFAULT_MODEL,
             messages=[
-                {"role": "system",
-                 "content": "Tu es un assistant qui génère des fiches de révision claires, structurées et synthétiques (titres, puces, exemples)."},
-                {"role": "user",
-                 "content": f"Crée une fiche de révision claire et concise pour le cours « {cours_titre} » à partir de ce contenu :\n\n{source}"}
+                {"role": "system", "content": SYSTEM_SUMMARY},
+                {"role": "user", "content": user_prompt},
             ],
-            temperature=0.4
+            temperature=0.4,
+            max_tokens=1200,
         )
         summary = resp.choices[0].message.content
         pdf_path = export_to_pdf(summary)
         return summary, pdf_path
+
     except Exception as e:
-        traceback.print_exc()
-        return f"Erreur : {str(e)}", None
+        return f"❌ Erreur : {e}", None
 
-# === Gradio UI ===
-iface = gr.Interface(
-    fn=generate_summary,
-    inputs=[
-        gr.File(label="Téléverser un fichier (.txt, .pdf, .docx)"),
-        gr.Textbox(label="Titre du cours", placeholder="Ex: Chapitre 3 – Thermodynamique")
-    ],
-    outputs=[
-        gr.Textbox(label="Fiche de révision générée", lines=18),
-        gr.File(label="Télécharger le PDF")
-    ],
-    title="🧠 MémoMaster - Générateur de fiches IA",
-    description="Générez automatiquement des fiches de révision à partir de vos cours (.pdf/.docx/.txt).",
-)
+# === IA : bulle de chat (tuteur) ============================================
 
-# === Lancement Render / Local ===
+def tutor_chat(message, history):
+    """
+    history: liste [(user_msg, assistant_msg), ...]
+    retourne la réponse assistant (str)
+    """
+    try:
+        msgs = [{"role": "system", "content": SYSTEM_TUTOR}]
+
+        # Reconstituer le contexte
+        for user_msg, assistant_msg in history:
+            if user_msg:
+                msgs.append({"role": "user", "content": user_msg})
+            if assistant_msg:
+                msgs.append({"role": "assistant", "content": assistant_msg})
+
+        msgs.append({"role": "user", "content": message})
+
+        resp = client.chat.completions.create(
+            model=DEFAULT_MODEL,
+            messages=msgs,
+            temperature=0.3,
+            max_tokens=700,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        return f"❌ Erreur : {e}"
+
+# === UI Gradio ===============================================================
+
+CUSTOM_CSS = """
+footer {display:none !important;}
+.svelte-1ipelgc {display:none !important;}
+"""
+
+with gr.Blocks(css=CUSTOM_CSS, theme=gr.themes.Soft()) as app:
+    gr.Markdown("# 🧠 MémoMaster")
+
+    with gr.Tab("📝 Générateur de fiches"):
+        gen = gr.Interface(
+            fn=generate_summary,
+            inputs=[
+                gr.File(label="Téléverser un fichier (.txt, .pdf, .docx)"),
+                gr.Textbox(label="Titre du cours", placeholder="Ex: Chapitre 3 – Thermodynamique"),
+            ],
+            outputs=[
+                gr.Textbox(label="Fiche de révision générée"),
+                gr.File(label="⬇️ Télécharger le PDF"),
+            ],
+            title="Générateur de fiches IA",
+            description="Téléverse ton cours, donne un titre, puis clique Submit.",
+            allow_flagging="never",
+        )
+        gen.render()
+
+    with gr.Tab("💬 Chat IA"):
+        gr.ChatInterface(
+            fn=tutor_chat,
+            title="Bulle de chat — Tuteur IA",
+            description="Pose tes questions, demande des explications, des quiz, des résumés…",
+            retry_btn="Reformuler",
+            undo_btn="Annuler la dernière",
+            clear_btn="Nouvelle discussion",
+            textbox=gr.Textbox(placeholder="Écris ici… (Entrée pour envoyer)"),
+        )
+
+# === Lancement pour Render ===================================================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 7860))  # Render injecte PORT
-    iface.launch(server_name="0.0.0.0", server_port=port, share=False)
+    port = int(os.environ.get("PORT", 10000))
+    app.launch(server_name="0.0.0.0", server_port=port, share=False)
