@@ -1,4 +1,4 @@
-openai
+openai>=1.45.0
 gradio>=4.44.0
 reportlab
 python-docx
