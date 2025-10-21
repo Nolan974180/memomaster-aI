@@ -1,0 +1,5 @@
+openai
+gradio
+reportlab
+python-docx
+pdfminer.six
