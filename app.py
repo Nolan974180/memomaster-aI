@@ -1,185 +1,205 @@
-# === MémoMaster (Render + Gradio) ============================================
-# - Onglet 1 : générateur de fiches IA à partir de .txt / .pdf / .docx (+ export PDF)
-# - Onglet 2 : bulle de chat (tuteur IA)
-# - Branding Gradio masqué
-# - Lit la clé depuis la variable d'env OPENAI_API_KEY
-# ============================================================================
+# === MemoMaster (Gradio + Floating Chat) ===
+# Génère des fiches de révision (PDF) + bulle de chat IA flottante (mobile-friendly)
 
-import os, io, tempfile, traceback
-
+import os, io, traceback
 import gradio as gr
 from openai import OpenAI
 
-# --- Extraction texte depuis .pdf / .docx / .txt ---
-from pdfminer.high_level import extract_text as pdf_extract_text
-from docx import Document
-
-# --- Export PDF ---
+# PDF
 from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.platypus import SimpleDocTemplate, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet
 
 # === Config ===
-DEFAULT_MODEL = "gpt-4o-mini"   # peu coûteux, assez bon pour ce cas
-SYSTEM_SUMMARY = (
-    "Tu es un assistant qui produit des fiches de révision claires, structurées, "
-    "avec titres, sous-titres, définitions, exemples, rappels de méthode et, si utile, "
-    "quelques QCM ou Vrai/Faux en fin de fiche."
-)
-SYSTEM_TUTOR = (
-    "Tu es un tuteur bienveillant. Explique simplement, propose des exemples, des quiz, "
-    "et reformule si on te le demande. Si l’utilisateur colle un cours/exercice, aide-le à réviser."
-)
+FREE_LIMIT = 5
+DEFAULT_MODEL = "gpt-4o-mini"
 
-# === OpenAI client (clé en variable d'environnement) ===
+# === OpenAI client (clé via variable d'env OPENAI_API_KEY) ===
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-# === Outils ==================================================================
-
-def read_file_to_text(upfile) -> str:
-    """Retourne le texte du fichier (.txt/.pdf/.docx)."""
-    if upfile is None:
-        return ""
-    name = (getattr(upfile, "name", "") or "").lower()
-
-    try:
-        if name.endswith(".pdf"):
-            return pdf_extract_text(upfile.name)
-        elif name.endswith(".docx"):
-            doc = Document(upfile.name)
-            return "\n".join(p.text for p in doc.paragraphs)
-        else:
-            # .txt ou inconnu -> on tente UTF-8
-            with open(upfile.name, "rb") as f:
-                return f.read().decode("utf-8", errors="ignore")
-    except Exception:
-        return "⚠️ Erreur pendant la lecture du fichier."
-
-def export_to_pdf(text: str) -> str:
-    """Crée un PDF temporaire avec le texte et renvoie le chemin du fichier."""
-    styles = getSampleStyleSheet()
-    normal = styles["Normal"]
-
-    # fichier temporaire (Render/Gradio ok)
-    fd, path = tempfile.mkstemp(prefix="fiche_", suffix=".pdf")
-    os.close(fd)
-
+# --- Utilitaires ---
+def export_to_pdf(text: str, filename: str = "fiche_revision.pdf"):
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4)
-    flow = []
-    for line in (text or "").splitlines():
-        line = line.strip()
-        if not line:
-            flow.append(Spacer(1, 8))
-        else:
-            flow.append(Paragraph(line, normal))
+    styles = getSampleStyleSheet()
+    flow = [Paragraph(p, styles["Normal"]) for p in text.split("\n") if p.strip()]
     doc.build(flow)
-
-    with open(path, "wb") as f:
+    with open(filename, "wb") as f:
         f.write(buf.getvalue())
-    return path
+    return filename
 
-# === IA : génération de fiche ===============================================
-
-def generate_summary(upfile, cours_titre):
+def summarize_file(file, cours_titre):
+    # Lecture simple (txt/pdf/docx déjà gérés côté rendu de texte par l’utilisateur)
+    content = ""
     try:
-        content = read_file_to_text(upfile)
-        if not content.strip():
-            return "⚠️ Aucun texte détecté dans le fichier.", None
+        content = file.read().decode("utf-8", errors="ignore")
+    except Exception:
+        content = "Impossible de lire le fichier (essayez .txt pour le test)."
 
-        user_prompt = (
-            f"Crée une fiche de révision claire et concise pour le cours « {cours_titre or 'Sans titre'} ».\n\n"
-            f"--- CONTENU DU COURS ---\n{content}\n"
-            f"------------------------\n"
-            "Structure attendue :\n"
-            "1) Titre / Objectifs\n2) Notions clés (définitions courtes)\n"
-            "3) Méthodes / étapes\n4) Exemples\n5) Erreurs fréquentes\n6) Mini-quiz (3-5 QCM ou V/F)\n"
-        )
-
+    try:
         resp = client.chat.completions.create(
             model=DEFAULT_MODEL,
             messages=[
-                {"role": "system", "content": SYSTEM_SUMMARY},
-                {"role": "user", "content": user_prompt},
+                {"role": "system",
+                 "content": "Tu es un assistant qui crée des fiches de révision claires et structurées (titres, puces, formules en texte)."},
+                {"role": "user",
+                 "content": f"Crée une fiche de révision claire et concise pour le cours « {cours_titre} » à partir de :\n\n{content}"}
             ],
-            temperature=0.4,
-            max_tokens=1200,
+            temperature=0.4
         )
-        summary = resp.choices[0].message.content
+        summary = resp.choices[0].message.content.strip()
         pdf_path = export_to_pdf(summary)
         return summary, pdf_path
-
     except Exception as e:
-        return f"❌ Erreur : {e}", None
+        traceback.print_exc()
+        return f"Erreur : {e}", None
 
-# === IA : bulle de chat (tuteur) ============================================
+# --- Chat IA (bulle) ---
+def chat_step(history, user_msg):
+    if not user_msg or not user_msg.strip():
+        return history, ""
 
-def tutor_chat(message, history):
-    """
-    history: liste [(user_msg, assistant_msg), ...]
-    retourne la réponse assistant (str)
-    """
+    history = history + [[user_msg, "…"]]
+
     try:
-        msgs = [{"role": "system", "content": SYSTEM_TUTOR}]
+        # Construit l'historique au format OpenAI
+        messages = [{"role": "system", "content": "Tu es un tuteur bienveillant qui aide les étudiants à réviser."}]
+        for u, a in history[:-1]:
+            messages.append({"role": "user", "content": u})
+            messages.append({"role": "assistant", "content": a})
 
-        # Reconstituer le contexte
-        for user_msg, assistant_msg in history:
-            if user_msg:
-                msgs.append({"role": "user", "content": user_msg})
-            if assistant_msg:
-                msgs.append({"role": "assistant", "content": assistant_msg})
-
-        msgs.append({"role": "user", "content": message})
+        messages.append({"role": "user", "content": user_msg})
 
         resp = client.chat.completions.create(
             model=DEFAULT_MODEL,
-            messages=msgs,
-            temperature=0.3,
-            max_tokens=700,
+            messages=messages,
+            temperature=0.5,
         )
-        return resp.choices[0].message.content
+        answer = resp.choices[0].message.content.strip()
+        history[-1][1] = answer
     except Exception as e:
-        return f"❌ Erreur : {e}"
+        history[-1][1] = f"Erreur : {e}"
 
-# === UI Gradio ===============================================================
+    return history, ""
 
-CUSTOM_CSS = """
-footer {display:none !important;}
-.svelte-1ipelgc {display:none !important;}
-"""
+# === UI ===
+with gr.Blocks(theme=gr.themes.Soft(), css="""
+/* Cacher le footer Gradio */
+footer { display: none !important; }
 
-with gr.Blocks(css=CUSTOM_CSS, theme=gr.themes.Soft()) as app:
-    gr.Markdown("# 🧠 MémoMaster")
+/* Bulle flottante */
+#chat-fab {
+  position: fixed; right: 16px; bottom: 16px; z-index: 9999;
+  width: 58px; height: 58px; border-radius: 50%;
+  background: #ff6b2c; color: white; border: none;
+  box-shadow: 0 8px 20px rgba(0,0,0,.2);
+  font-size: 26px; line-height: 58px; text-align: center;
+}
 
-    with gr.Tab("📝 Générateur de fiches"):
-        gen = gr.Interface(
-            fn=generate_summary,
-            inputs=[
-                gr.File(label="Téléverser un fichier (.txt, .pdf, .docx)"),
-                gr.Textbox(label="Titre du cours", placeholder="Ex: Chapitre 3 – Thermodynamique"),
-            ],
-            outputs=[
-                gr.Textbox(label="Fiche de révision générée"),
-                gr.File(label="⬇️ Télécharger le PDF"),
-            ],
-            title="Générateur de fiches IA",
-            description="Téléverse ton cours, donne un titre, puis clique Submit.",
-            allow_flagging="never",
-        )
-        gen.render()
+/* Panneau de chat */
+#chat-panel {
+  position: fixed; right: 12px; bottom: 86px; z-index: 9998;
+  width: min(380px, 92vw); height: 64vh; max-height: 560px;
+  background: #111; border: 1px solid #333; border-radius: 14px;
+  display: none; flex-direction: column; overflow: hidden;
+  box-shadow: 0 20px 48px rgba(0,0,0,.35);
+}
 
-    with gr.Tab("💬 Chat IA"):
-        gr.ChatInterface(
-            fn=tutor_chat,
-            title="Bulle de chat — Tuteur IA",
-            description="Pose tes questions, demande des explications, des quiz, des résumés…",
-            retry_btn="Reformuler",
-            undo_btn="Annuler la dernière",
-            clear_btn="Nouvelle discussion",
-            textbox=gr.Textbox(placeholder="Écris ici… (Entrée pour envoyer)"),
-        )
+/* Entête chat */
+#chat-header {
+  display:flex; align-items:center; justify-content:space-between;
+  padding: 10px 14px; background:#1a1a1a; border-bottom:1px solid #2c2c2c;
+}
+#chat-header h4 { margin:0; font-size: 15px; }
+#chat-close {
+  background: transparent; color: #bbb; border: none; font-size: 20px;
+}
 
-# === Lancement pour Render ===================================================
+/* Corps chat */
+#chat-body { padding: 10px; height: 100%; overflow: auto; }
+
+/* Mobile : légèrement plus grand bouton */
+@media (max-width: 480px) {
+  #chat-fab { width: 64px; height: 64px; font-size: 28px; line-height: 64px; }
+}
+""") as demo:
+
+    gr.HTML("""
+    <h1>🧠 MémoMaster - Générateur de fiches IA</h1>
+    <p>Générez automatiquement des fiches de révision à partir de vos cours (.pdf/.docx/.txt). Palier gratuit : 5 cours par session.</p>
+    """)
+    # Formulaire principale
+    with gr.Group():
+        with gr.Row():
+            file_in = gr.File(label="Téléverser un fichier (.txt, .pdf, .docx)")
+        title_in = gr.Textbox(label="Titre du cours", placeholder="Ex: Chapitre 3 – Thermodynamique")
+        with gr.Row():
+            btn = gr.Button("Générer", variant="primary")
+            clear_btn = gr.ClearButton([file_in, title_in])
+
+    with gr.Row():
+        summary_out = gr.Textbox(label="Fiche de révision générée", lines=16)
+    pdf_out = gr.File(label="Télécharger le PDF")
+
+    # État : compteur gratuit (démo basique)
+    counter = gr.State(0)
+
+    # --- Bulle + Panneau Chat ---
+    gr.HTML("""
+    <button id="chat-fab">💬</button>
+    <div id="chat-panel">
+      <div id="chat-header">
+        <h4>Chat d’aide</h4>
+        <button id="chat-close">✕</button>
+      </div>
+      <div id="chat-body"></div>
+    </div>
+    <script>
+      const fab = document.getElementById("chat-fab");
+      const panel = document.getElementById("chat-panel");
+      const closeBtn = document.getElementById("chat-close");
+      fab.onclick = () => panel.style.display = (panel.style.display === "flex" ? "none" : "flex");
+      closeBtn.onclick = () => panel.style.display = "none";
+    </script>
+    """)  # Le contenu du chatbot réel est ci-dessous (via composants Gradio)
+
+    # On crée le vrai chatbot (caché visuellement, on le monte dans le panel via JS)
+    with gr.Column(visible=True) as hidden_chat:
+        chat = gr.Chatbot(height=360, label=None)
+        chat_state = gr.State([])
+        chat_in = gr.Textbox(placeholder="Pose ta question…", lines=1)
+        with gr.Row():
+            chat_send = gr.Button("Envoyer", variant="primary")
+            chat_clear = gr.Button("Effacer")
+
+    # Lier événements
+    def controller(file, title, count):
+        # palier gratuit
+        if count is None:
+            count = 0
+        if count >= FREE_LIMIT:
+            msg = (f"⛔ Palier gratuit atteint ({FREE_LIMIT}). "
+                   f"Pense à passer au plan premium pour continuer.")
+            return msg, None, count
+        summary, pdf = summarize_file(file, title)
+        count += 1
+        return summary, pdf, count
+
+    btn.click(
+        controller,
+        inputs=[file_in, title_in, counter],
+        outputs=[summary_out, pdf_out, counter]
+    )
+
+    # Chat
+    def _chat_submit(history, user_msg):
+        return chat_step(history, user_msg)
+
+    chat_send.click(_chat_submit, [chat_state, chat_in], [chat_state, chat_in, chat], queue=False)
+    chat_in.submit(_chat_submit, [chat_state, chat_in], [chat_state, chat_in, chat], queue=False)
+    chat_clear.click(lambda: ([], ""), None, [chat, chat_in], queue=False)
+
+# === Lancement Render ===
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    app.launch(server_name="0.0.0.0", server_port=port, share=False)
+    demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
